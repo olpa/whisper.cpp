@@ -128,6 +128,13 @@ extern "C" {
         size_t dtw_mem_size; // TODO: remove
     };
 
+    // Structure to hold a single candidate token with its probability
+    typedef struct whisper_token_candidate {
+        whisper_token id;   // token id
+        float p;            // probability
+        float plog;         // log probability
+    } whisper_token_candidate;
+
     typedef struct whisper_token_data {
         whisper_token id;  // token id
         whisper_token tid; // forced timestamp token id
@@ -509,6 +516,10 @@ extern "C" {
         bool  split_on_word;    // split on word rather than on token (when used with max_len)
         int   max_tokens;       // max tokens per segment (0 = no limit)
 
+        // [EXPERIMENTAL] top candidate tokens
+        bool capture_top_candidates; // capture top N candidate tokens with their probabilities
+        int  n_top_candidates;       // number of top candidates to capture (default: 20)
+
         // [EXPERIMENTAL] speed-up techniques
         // note: these can significantly reduce the quality of the output
         bool debug_mode;        // enable debug_mode provides extra info (eg. Dump log_mel)
@@ -670,6 +681,16 @@ extern "C" {
     // Get the probability of the specified token in the specified segment
     WHISPER_API float whisper_full_get_token_p           (struct whisper_context * ctx, int i_segment, int i_token);
     WHISPER_API float whisper_full_get_token_p_from_state(struct whisper_state * state, int i_segment, int i_token);
+
+    // Get the number of top candidate tokens stored for the specified token in the specified segment
+    // Returns 0 if no candidates were stored (when capture_top_candidates is disabled)
+    WHISPER_API int whisper_full_n_top_candidates           (struct whisper_context * ctx, int i_segment, int i_token);
+    WHISPER_API int whisper_full_n_top_candidates_from_state(struct whisper_state * state, int i_segment, int i_token);
+
+    // Get the i-th top candidate token for the specified token in the specified segment
+    // i should be in range [0, whisper_full_n_top_candidates())
+    WHISPER_API whisper_token_candidate whisper_full_get_top_candidate           (struct whisper_context * ctx, int i_segment, int i_token, int i_candidate);
+    WHISPER_API whisper_token_candidate whisper_full_get_top_candidate_from_state(struct whisper_state * state, int i_segment, int i_token, int i_candidate);
 
     //
     // Voice Activity Detection (VAD)
