@@ -525,6 +525,10 @@ extern "C" {
         bool debug_mode;        // enable debug_mode provides extra info (eg. Dump log_mel)
         int  audio_ctx;         // overwrite the audio context size (0 = use default)
 
+        // [EXPERIMENTAL] skip encoding - reuse kv_cross from previous whisper_encode() call
+        // useful for decode-only passes when exploring alternative token sequences
+        bool skip_encode;
+
         // [EXPERIMENTAL] [TDRZ] tinydiarize
         bool tdrz_enable;       // enable tinydiarize speaker turn detection
 
@@ -539,6 +543,12 @@ extern "C" {
         bool carry_initial_prompt; // if true, always prepend initial_prompt to every decode window (may reduce conditioning on previous text)
         const whisper_token * prompt_tokens;
         int prompt_n_tokens;
+
+        // [EXPERIMENTAL] forced tokens - force specific tokens at the start of decoding
+        // these tokens are output directly instead of sampling, useful for exploring alternative transcriptions
+        // decoding continues normally after forced tokens are exhausted
+        const whisper_token * forced_tokens;
+        int forced_n_tokens;
 
         // for auto-detection, set to nullptr, "" or "auto"
         const char * language;

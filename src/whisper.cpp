@@ -5941,6 +5941,8 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /*.debug_mode        =*/ false,
         /*.audio_ctx         =*/ 0,
 
+        /*.skip_encode       =*/ false,
+
         /*.tdrz_enable       =*/ false,
 
         /* suppress_regex    =*/ nullptr,
@@ -5949,6 +5951,9 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /*.carry_initial_prompt =*/ false,
         /*.prompt_tokens        =*/ nullptr,
         /*.prompt_n_tokens      =*/ 0,
+
+        /*.forced_tokens        =*/ nullptr,
+        /*.forced_n_tokens      =*/ 0,
 
         /*.language          =*/ "en",
         /*.detect_language   =*/ false,
@@ -7033,6 +7038,12 @@ int whisper_full_with_state(
             break;
         }
 
+        // skip encoding if requested (reuse kv_cross from previous encode)
+        if (params.skip_encode) {
+            WHISPER_LOG_DEBUG("%s: skipping encode (skip_encode=true)\n", __func__);
+            goto skip_encode;
+        }
+
         if (params.encoder_begin_callback) {
             if (params.encoder_begin_callback(ctx, state, params.encoder_begin_callback_user_data) == false) {
                 WHISPER_LOG_ERROR("%s: encoder_begin_callback returned false - aborting\n", __func__);
@@ -7046,6 +7057,7 @@ int whisper_full_with_state(
             return -6;
         }
 
+skip_encode:
         // if there is a very short audio segment left to process, we remove any past prompt since it tends
         // to confuse the decoder and often make it repeat or hallucinate stuff
         if (seek > seek_start && seek + 500 >= seek_end) {
@@ -7236,7 +7248,22 @@ int whisper_full_with_state(
                             switch (params.strategy) {
                                 case whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY:
                                     {
-                                        if (t_cur < 1e-6f) {
+                                        // Check if we should use a forced token
+                                        if (params.forced_tokens != nullptr && i < params.forced_n_tokens) {
+                                            // Use forced token instead of sampling
+                                            whisper_token_data forced;
+                                            forced.id = params.forced_tokens[i];
+                                            forced.tid = whisper_token_beg(ctx);
+                                            forced.p = decoder.probs[forced.id];
+                                            forced.plog = decoder.logprobs[forced.id];
+                                            forced.pt = -1.0f;
+                                            forced.ptsum = -1.0f;
+                                            forced.t0 = -1;
+                                            forced.t1 = -1;
+                                            forced.t_dtw = -1;
+                                            forced.vlen = 0;
+                                            decoder.sequence.tokens.push_back(forced);
+                                        } else if (t_cur < 1e-6f) {
                                             decoder.sequence.tokens.push_back(whisper_sample_token(*ctx, decoder, true));
                                         } else {
                                             decoder.sequence.tokens.push_back(whisper_sample_token(*ctx, decoder, false));
