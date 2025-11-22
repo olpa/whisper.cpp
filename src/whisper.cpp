@@ -7215,9 +7215,71 @@ skip_encode:
 
                     state->t_sample_us += ggml_time_us() - t_start_sample_us;
                 }
+
+                // Handle forced tokens before the main decode loop
+                if (params.forced_tokens != nullptr && params.forced_n_tokens > 0) {
+                    for (int i = 0; i < params.forced_n_tokens; ++i) {
+                        // Build forced token data using current logits
+                        whisper_token_data forced;
+                        forced.id = params.forced_tokens[i];
+                        forced.tid = whisper_token_beg(ctx);
+                        forced.p = state->decoders[0].probs[forced.id];
+                        forced.plog = state->decoders[0].logprobs[forced.id];
+                        forced.pt = -1.0f;
+                        forced.ptsum = -1.0f;
+                        forced.t0 = -1;
+                        forced.t1 = -1;
+                        forced.t_dtw = -1;
+                        forced.vlen = 0;
+
+                        // Add to all decoder sequences
+                        for (int j = 0; j < n_decoders_cur; ++j) {
+                            auto & decoder = state->decoders[j];
+                            decoder.sequence.tokens.push_back(forced);
+                            decoder.sequence.sum_logprobs_all += forced.plog;
+
+                            if (params.capture_top_candidates) {
+                                auto top_cands = whisper_get_top_candidates(*ctx, decoder, params.n_top_candidates);
+                                decoder.sequence.top_candidates.push_back(std::move(top_cands));
+                            }
+                        }
+
+                        // Decode the forced token to get logits for next position
+                        if (i < params.forced_n_tokens - 1 || params.forced_n_tokens < whisper_n_text_ctx(ctx)/2 - 4) {
+                            auto & batch = state->batch;
+                            batch.n_tokens = 0;
+
+                            const int n_past = prompt.size() + i;
+
+                            for (int j = 0; j < n_decoders_cur; ++j) {
+                                auto & decoder = state->decoders[j];
+                                decoder.i_batch = batch.n_tokens;
+
+                                batch.token   [batch.n_tokens]    = forced.id;
+                                batch.pos     [batch.n_tokens]    = n_past;
+                                batch.n_seq_id[batch.n_tokens]    = 1;
+                                batch.seq_id  [batch.n_tokens][0] = j;
+                                batch.logits  [batch.n_tokens]    = 1;
+                                batch.n_tokens++;
+                            }
+
+                            if (!whisper_decode_internal(*ctx, *state, batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
+                                WHISPER_LOG_ERROR("%s: failed to decode forced token %d\n", __func__, i);
+                                return -8;
+                            }
+
+                            // Process logits for next iteration
+                            for (int j = 0; j < n_decoders_cur; ++j) {
+                                auto & decoder = state->decoders[j];
+                                whisper_process_logits(*ctx, *state, decoder, params, t_cur);
+                            }
+                        }
+                    }
+                }
             }
 
-            for (int i = 0, n_max = whisper_n_text_ctx(ctx)/2 - 4; i < n_max; ++i) {
+            const int i_start = (params.forced_tokens != nullptr) ? params.forced_n_tokens : 0;
+            for (int i = i_start, n_max = whisper_n_text_ctx(ctx)/2 - 4; i < n_max; ++i) {
                 const int64_t t_start_sample_us = ggml_time_us();
 
                 if (params.strategy == whisper_sampling_strategy::WHISPER_SAMPLING_BEAM_SEARCH) {
@@ -7248,22 +7310,7 @@ skip_encode:
                             switch (params.strategy) {
                                 case whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY:
                                     {
-                                        // Check if we should use a forced token
-                                        if (params.forced_tokens != nullptr && i < params.forced_n_tokens) {
-                                            // Use forced token instead of sampling
-                                            whisper_token_data forced;
-                                            forced.id = params.forced_tokens[i];
-                                            forced.tid = whisper_token_beg(ctx);
-                                            forced.p = decoder.probs[forced.id];
-                                            forced.plog = decoder.logprobs[forced.id];
-                                            forced.pt = -1.0f;
-                                            forced.ptsum = -1.0f;
-                                            forced.t0 = -1;
-                                            forced.t1 = -1;
-                                            forced.t_dtw = -1;
-                                            forced.vlen = 0;
-                                            decoder.sequence.tokens.push_back(forced);
-                                        } else if (t_cur < 1e-6f) {
+                                        if (t_cur < 1e-6f) {
                                             decoder.sequence.tokens.push_back(whisper_sample_token(*ctx, decoder, true));
                                         } else {
                                             decoder.sequence.tokens.push_back(whisper_sample_token(*ctx, decoder, false));
