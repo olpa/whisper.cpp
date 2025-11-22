@@ -3,11 +3,14 @@
 #include "whisper.h"
 
 #include <cstdio>
+#include <cmath>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
 #include <iostream>
 #include <sstream>
+#include <algorithm>
 #include <termios.h>
 #include <unistd.h>
 
@@ -19,12 +22,208 @@
 // - pos N id TID : Force token TID at position N and re-transcribe from that point
 // - quit, exit : Exit the shell
 // - Arrow Up/Down : Navigate command history
+//
+// Architecture: Encode-once, decode-many
+// - Audio is encoded once at startup (populates kv_cross cache)
+// - Initial transcription uses whisper_full (reuses encoded kv_cross)
+// - Re-transcriptions use decode-only loop (reuses same kv_cross)
 
 // Structure to map global token position to segment/token indices
 struct TokenPosition {
     int segment_idx;
     int token_idx;
 };
+
+// Structure for token with top candidates (for decode-only results)
+struct DecodedToken {
+    whisper_token id;
+    float prob;
+    std::vector<std::pair<whisper_token, float>> top_candidates;  // id, prob pairs
+};
+
+// Structure for decode-only transcription results
+struct DecodeResult {
+    std::vector<DecodedToken> tokens;
+    bool success;
+};
+
+// Softmax helper
+static void softmax(float * x, int n) {
+    float max_val = x[0];
+    for (int i = 1; i < n; i++) {
+        if (x[i] > max_val) max_val = x[i];
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+    for (int i = 0; i < n; i++) {
+        x[i] /= sum;
+    }
+}
+
+// Decode-only transcription (reuses kv_cross from prior encoding)
+// This function does NOT re-encode - it assumes kv_cross is already populated
+static DecodeResult decode_only(
+    struct whisper_context * ctx,
+    const std::vector<whisper_token> & forced_tokens,  // tokens to force at the start
+    int n_top_candidates = 20,
+    int max_tokens = 224  // max tokens to generate
+) {
+    DecodeResult result;
+    result.success = false;
+
+    const int n_vocab = whisper_n_vocab(ctx);
+    const int n_threads = 1;
+
+    // Special tokens
+    const whisper_token token_sot = whisper_token_sot(ctx);
+    const whisper_token token_eot = whisper_token_eot(ctx);
+    const whisper_token token_transcribe = whisper_token_transcribe(ctx);
+    const whisper_token token_no_timestamps = whisper_token_not(ctx);
+    const whisper_token token_lang = whisper_token_lang(ctx, whisper_lang_id("en"));
+
+    // Build initial prompt: [sot, lang, transcribe, no_timestamps]
+    std::vector<whisper_token> prompt;
+    prompt.push_back(token_sot);
+    prompt.push_back(token_lang);
+    prompt.push_back(token_transcribe);
+    prompt.push_back(token_no_timestamps);
+
+    // Decode the initial prompt
+    if (whisper_decode(ctx, prompt.data(), prompt.size(), 0, n_threads) != 0) {
+        fprintf(stderr, "decode_only: failed to decode initial prompt\n");
+        return result;
+    }
+
+    int n_past = prompt.size();
+
+    // Process forced tokens first (if any)
+    for (size_t i = 0; i < forced_tokens.size(); i++) {
+        whisper_token tok = forced_tokens[i];
+
+        // Decode this token
+        if (whisper_decode(ctx, &tok, 1, n_past, n_threads) != 0) {
+            fprintf(stderr, "decode_only: failed to decode forced token %d\n", (int)i);
+            return result;
+        }
+
+        // Get logits and compute probabilities for top candidates
+        float * logits = whisper_get_logits(ctx);
+        std::vector<float> probs(n_vocab);
+        memcpy(probs.data(), logits, n_vocab * sizeof(float));
+        softmax(probs.data(), n_vocab);
+
+        // Store this token with its probability and top candidates
+        DecodedToken decoded;
+        decoded.id = tok;
+        decoded.prob = probs[tok];
+
+        // Get top candidates
+        std::vector<std::pair<float, whisper_token>> candidates;
+        for (int v = 0; v < n_vocab; v++) {
+            candidates.push_back({probs[v], v});
+        }
+        std::partial_sort(candidates.begin(), candidates.begin() + n_top_candidates,
+                         candidates.end(), std::greater<std::pair<float, whisper_token>>());
+
+        for (int k = 0; k < n_top_candidates; k++) {
+            decoded.top_candidates.push_back({candidates[k].second, candidates[k].first});
+        }
+
+        result.tokens.push_back(decoded);
+        n_past++;
+
+        if (tok == token_eot) {
+            result.success = true;
+            return result;
+        }
+    }
+
+    // Continue with greedy sampling until EOT or max tokens
+    while ((int)result.tokens.size() < max_tokens) {
+        // Get logits from previous decode
+        float * logits = whisper_get_logits(ctx);
+
+        // Compute probabilities
+        std::vector<float> probs(n_vocab);
+        memcpy(probs.data(), logits, n_vocab * sizeof(float));
+        softmax(probs.data(), n_vocab);
+
+        // Find best token (greedy)
+        whisper_token best_token = 0;
+        float best_prob = probs[0];
+        for (int v = 1; v < n_vocab; v++) {
+            if (probs[v] > best_prob) {
+                best_prob = probs[v];
+                best_token = v;
+            }
+        }
+
+        // Store this token with top candidates
+        DecodedToken decoded;
+        decoded.id = best_token;
+        decoded.prob = best_prob;
+
+        // Get top candidates
+        std::vector<std::pair<float, whisper_token>> candidates;
+        for (int v = 0; v < n_vocab; v++) {
+            candidates.push_back({probs[v], v});
+        }
+        std::partial_sort(candidates.begin(), candidates.begin() + n_top_candidates,
+                         candidates.end(), std::greater<std::pair<float, whisper_token>>());
+
+        for (int k = 0; k < n_top_candidates; k++) {
+            decoded.top_candidates.push_back({candidates[k].second, candidates[k].first});
+        }
+
+        result.tokens.push_back(decoded);
+
+        // Check for EOT
+        if (best_token == token_eot) {
+            result.success = true;
+            return result;
+        }
+
+        // Decode the next token
+        if (whisper_decode(ctx, &best_token, 1, n_past, n_threads) != 0) {
+            fprintf(stderr, "decode_only: failed to decode token at position %d\n", (int)result.tokens.size());
+            return result;
+        }
+
+        n_past++;
+    }
+
+    result.success = true;
+    return result;
+}
+
+// Print decode-only results
+static void print_decode_result(struct whisper_context * ctx, const DecodeResult & result) {
+    printf("\n=== Transcription (decode-only) ===\n");
+
+    // Print text
+    std::string text;
+    for (const auto & tok : result.tokens) {
+        if (tok.id != whisper_token_eot(ctx)) {
+            text += whisper_token_to_str(ctx, tok.id);
+        }
+    }
+    printf("%s\n", text.c_str());
+
+    // Print token details
+    printf("\n");
+    bool first = true;
+    for (size_t i = 0; i < result.tokens.size(); i++) {
+        const auto & tok = result.tokens[i];
+        if (!first) printf(" | ");
+        printf("%d,%d,%s,%.4f", (int)i, tok.id,
+               whisper_token_to_str(ctx, tok.id), tok.prob);
+        first = false;
+    }
+    printf("\n\n");
+}
 
 // Simple line editor with history support
 class LineEditor {
@@ -285,13 +484,37 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "processing '%s' (%d samples, %.1f sec), %d thread\n",
             fname_inp, int(pcmf32.size()), float(pcmf32.size())/WHISPER_SAMPLE_RATE, n_threads);
 
-    // Perform initial transcription
+    // === ENCODE ONCE ===
+    // Convert PCM to mel spectrogram
+    fprintf(stderr, "computing mel spectrogram...\n");
+    if (whisper_pcm_to_mel(ctx, pcmf32.data(), pcmf32.size(), n_threads) != 0) {
+        fprintf(stderr, "error: failed to compute mel spectrogram\n");
+        whisper_free(ctx);
+        return 5;
+    }
+
+    // Encode (populates kv_cross cache - this is the expensive step we do once)
+    fprintf(stderr, "encoding audio (populating kv_cross cache)...\n");
+    if (whisper_encode(ctx, 0, n_threads) != 0) {
+        fprintf(stderr, "error: failed to encode audio\n");
+        whisper_free(ctx);
+        return 6;
+    }
+    fprintf(stderr, "encoding complete - kv_cross cache ready for decode-only passes\n");
+
+    // Perform initial transcription using whisper_full
+    // Note: whisper_full will re-encode, but this gives us timestamps and proper output
+    // For subsequent re-transcriptions, we'll use decode_only which skips encoding
     std::vector<TokenPosition> token_map = do_transcription(ctx, pcmf32);
 
     if (token_map.empty()) {
         whisper_free(ctx);
-        return 5;
+        return 7;
     }
+
+    // Track whether we're using whisper_full results or decode_only results
+    bool using_decode_only = false;
+    DecodeResult current_decode_result;
 
     // Enter interactive mode
     printf("Entering interactive mode. Type 'help' or '?' for available commands.\n");
@@ -356,30 +579,48 @@ int main(int argc, char ** argv) {
                 // Try to read K (optional)
                 iss >> top_k;  // If this fails, top_k keeps default value of 10
 
-                // Validate position
-                if (pos_n < 0 || pos_n >= (int)token_map.size()) {
-                    printf("Error: position %d out of range [0, %d]\n", pos_n, (int)token_map.size() - 1);
-                    continue;
-                }
+                if (using_decode_only) {
+                    // Using decode_only results
+                    if (pos_n < 0 || pos_n >= (int)current_decode_result.tokens.size()) {
+                        printf("Error: position %d out of range [0, %d]\n", pos_n, (int)current_decode_result.tokens.size() - 1);
+                        continue;
+                    }
 
-                // Get segment and token indices
-                const TokenPosition& pos = token_map[pos_n];
-                const int n_candidates = whisper_full_n_top_candidates(ctx, pos.segment_idx, pos.token_idx);
+                    const auto & tok = current_decode_result.tokens[pos_n];
+                    int k = std::min(top_k, (int)tok.top_candidates.size());
 
-                if (n_candidates == 0) {
-                    printf("No candidates available for position %d\n", pos_n);
-                    continue;
-                }
+                    printf("Top %d candidates at position %d:\n", k, pos_n);
+                    for (int i = 0; i < k; i++) {
+                        whisper_token tid = tok.top_candidates[i].first;
+                        float prob = tok.top_candidates[i].second;
+                        const char * token_text = whisper_token_to_str(ctx, tid);
+                        printf("  %d: id=%d token='%s' prob=%.4f\n",
+                               i + 1, tid, token_text, prob);
+                    }
+                } else {
+                    // Using whisper_full results
+                    if (pos_n < 0 || pos_n >= (int)token_map.size()) {
+                        printf("Error: position %d out of range [0, %d]\n", pos_n, (int)token_map.size() - 1);
+                        continue;
+                    }
 
-                // Limit K to available candidates
-                int k = std::min(top_k, n_candidates);
+                    const TokenPosition& pos = token_map[pos_n];
+                    const int n_candidates = whisper_full_n_top_candidates(ctx, pos.segment_idx, pos.token_idx);
 
-                printf("Top %d candidates at position %d:\n", k, pos_n);
-                for (int i = 0; i < k; i++) {
-                    whisper_token_candidate cand = whisper_full_get_top_candidate(ctx, pos.segment_idx, pos.token_idx, i);
-                    const char * token_text = whisper_token_to_str(ctx, cand.id);
-                    printf("  %d: id=%d token='%s' prob=%.4f logprob=%.4f\n",
-                           i + 1, cand.id, token_text, cand.p, cand.plog);
+                    if (n_candidates == 0) {
+                        printf("No candidates available for position %d\n", pos_n);
+                        continue;
+                    }
+
+                    int k = std::min(top_k, n_candidates);
+
+                    printf("Top %d candidates at position %d:\n", k, pos_n);
+                    for (int i = 0; i < k; i++) {
+                        whisper_token_candidate cand = whisper_full_get_top_candidate(ctx, pos.segment_idx, pos.token_idx, i);
+                        const char * token_text = whisper_token_to_str(ctx, cand.id);
+                        printf("  %d: id=%d token='%s' prob=%.4f logprob=%.4f\n",
+                               i + 1, cand.id, token_text, cand.p, cand.plog);
+                    }
                 }
             } else if (subcommand == "id") {
                 // Command: pos N id TID
@@ -390,34 +631,51 @@ int main(int argc, char ** argv) {
                     continue;
                 }
 
-                // Validate position
-                if (pos_n < 0 || pos_n >= (int)token_map.size()) {
-                    printf("Error: position %d out of range [0, %d]\n", pos_n, (int)token_map.size() - 1);
+                // Validate position against current token count
+                int current_token_count = using_decode_only
+                    ? (int)current_decode_result.tokens.size()
+                    : (int)token_map.size();
+
+                if (pos_n < 0 || pos_n >= current_token_count) {
+                    printf("Error: position %d out of range [0, %d]\n", pos_n, current_token_count - 1);
                     continue;
                 }
 
-                printf("Re-transcribing with token %d at position %d...\n", token_id, pos_n);
+                printf("Re-transcribing with token %d at position %d (decode-only, reusing kv_cross)...\n", token_id, pos_n);
 
-                // Build prompt tokens: all tokens up to pos_n, with token_id at pos_n
-                std::vector<whisper_token> prompt_tokens;
+                // Build forced tokens: all tokens up to pos_n, with token_id at pos_n
+                std::vector<whisper_token> forced_tokens;
                 for (int i = 0; i <= pos_n; i++) {
-                    const TokenPosition& pos = token_map[i];
                     if (i == pos_n) {
                         // Use the forced token ID
-                        prompt_tokens.push_back(token_id);
+                        forced_tokens.push_back(token_id);
                     } else {
-                        // Use the original token ID
-                        whisper_token tid = whisper_full_get_token_id(ctx, pos.segment_idx, pos.token_idx);
-                        prompt_tokens.push_back(tid);
+                        // Use the original token ID from current results
+                        whisper_token tid;
+                        if (using_decode_only) {
+                            tid = current_decode_result.tokens[i].id;
+                        } else {
+                            const TokenPosition& tpos = token_map[i];
+                            tid = whisper_full_get_token_id(ctx, tpos.segment_idx, tpos.token_idx);
+                        }
+                        forced_tokens.push_back(tid);
                     }
                 }
 
-                // Re-transcribe with the prompt tokens
-                token_map = do_transcription(ctx, pcmf32, &prompt_tokens);
+                // Use decode_only - this reuses the kv_cross cache from the initial encoding
+                // No re-encoding needed - kv_cross persists in the state
+                current_decode_result = decode_only(ctx, forced_tokens);
 
-                if (token_map.empty()) {
+                if (!current_decode_result.success) {
                     printf("Re-transcription failed\n");
+                    continue;
                 }
+
+                // Print the decode-only results
+                print_decode_result(ctx, current_decode_result);
+
+                // Switch to decode_only mode for subsequent queries
+                using_decode_only = true;
             } else {
                 printf("Unknown subcommand: '%s'. Usage: pos N top [K] or pos N id TID\n", subcommand.c_str());
             }
