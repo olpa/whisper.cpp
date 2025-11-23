@@ -466,6 +466,10 @@ struct whisper_segment {
 
     std::vector<whisper_token_data> tokens;
 
+    // Top candidate tokens for each position (indexed by token position)
+    // Each entry contains a vector of top candidates with their probabilities
+    std::vector<std::vector<whisper_token_candidate>> top_candidates;
+
     bool speaker_turn_next;
 };
 
@@ -782,6 +786,9 @@ struct whisper_grammar_candidate {
 
 struct whisper_sequence {
     std::vector<whisper_token_data> tokens;
+
+    // Top candidate tokens for each position (same indexing as tokens)
+    std::vector<std::vector<whisper_token_candidate>> top_candidates;
 
     // the accumulated transcription in the current iteration (used to truncate the tokens array)
     int result_len;
@@ -5924,8 +5931,13 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /*.split_on_word     =*/ false,
         /*.max_tokens        =*/ 0,
 
+        /*.capture_top_candidates =*/ false,
+        /*.n_top_candidates       =*/ 20,
+
         /*.debug_mode        =*/ false,
         /*.audio_ctx         =*/ 0,
+
+        /*.skip_encode       =*/ false,
 
         /*.tdrz_enable       =*/ false,
 
@@ -5935,6 +5947,9 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /*.carry_initial_prompt =*/ false,
         /*.prompt_tokens        =*/ nullptr,
         /*.prompt_n_tokens      =*/ 0,
+
+        /*.forced_tokens        =*/ nullptr,
+        /*.forced_n_tokens      =*/ 0,
 
         /*.language          =*/ "en",
         /*.detect_language   =*/ false,
@@ -6477,6 +6492,54 @@ static whisper_token_data whisper_sample_token(
     return result;
 }
 
+// Extract top N candidate tokens sorted by probability
+static std::vector<whisper_token_candidate> whisper_get_top_candidates(
+            whisper_context & ctx,
+            whisper_decoder & decoder,
+                        int   n) {
+    const auto & vocab = ctx.vocab;
+    const auto & probs    = decoder.probs;
+    const auto & logprobs = decoder.logprobs;
+
+    const int n_logits = vocab.n_vocab;
+    auto & logits_id = decoder.logits_id;
+
+    // Create pairs of (probability, token_id)
+    logits_id.resize(n_logits);
+    for (int i = 0; i < n_logits; ++i) {
+        logits_id[i].first = probs[i];
+        logits_id[i].second = i;
+    }
+
+    // Partially sort to get top N by probability
+    const int k = std::min(n, n_logits);
+    {
+        using pair_type = std::remove_reference<decltype(logits_id)>::type::value_type;
+        std::partial_sort(
+                logits_id.begin(),
+                logits_id.begin() + k,
+                logits_id.end(),
+                [](const pair_type & a, const pair_type & b) {
+            return a.first > b.first;
+        });
+    }
+
+    // Extract top candidates
+    std::vector<whisper_token_candidate> result;
+    result.reserve(k);
+
+    for (int i = 0; i < k; ++i) {
+        const int id = logits_id[i].second;
+        result.push_back({
+            id,           // token id
+            probs[id],    // probability
+            logprobs[id]  // log probability
+        });
+    }
+
+    return result;
+}
+
 static std::vector<whisper_token_data> whisper_sample_token_topk(
             whisper_context & ctx,
             whisper_decoder & decoder,
@@ -7005,6 +7068,12 @@ int whisper_full_with_state(
             break;
         }
 
+        // skip encoding if requested (reuse kv_cross from previous encode)
+        if (params.skip_encode) {
+            WHISPER_LOG_DEBUG("%s: skipping encode (skip_encode=true)\n", __func__);
+            goto skip_encode;
+        }
+
         if (params.encoder_begin_callback) {
             if (params.encoder_begin_callback(ctx, state, params.encoder_begin_callback_user_data) == false) {
                 WHISPER_LOG_ERROR("%s: encoder_begin_callback returned false - aborting\n", __func__);
@@ -7018,6 +7087,7 @@ int whisper_full_with_state(
             return -6;
         }
 
+skip_encode:
         // if there is a very short audio segment left to process, we remove any past prompt since it tends
         // to confuse the decoder and often make it repeat or hallucinate stuff
         if (seek > seek_start && seek + 500 >= seek_end) {
@@ -7175,9 +7245,71 @@ int whisper_full_with_state(
 
                     state->t_sample_us += ggml_time_us() - t_start_sample_us;
                 }
+
+                // Handle forced tokens before the main decode loop
+                if (params.forced_tokens != nullptr && params.forced_n_tokens > 0) {
+                    for (int i = 0; i < params.forced_n_tokens; ++i) {
+                        // Build forced token data using current logits
+                        whisper_token_data forced;
+                        forced.id = params.forced_tokens[i];
+                        forced.tid = whisper_token_beg(ctx);
+                        forced.p = state->decoders[0].probs[forced.id];
+                        forced.plog = state->decoders[0].logprobs[forced.id];
+                        forced.pt = -1.0f;
+                        forced.ptsum = -1.0f;
+                        forced.t0 = -1;
+                        forced.t1 = -1;
+                        forced.t_dtw = -1;
+                        forced.vlen = 0;
+
+                        // Add to all decoder sequences
+                        for (int j = 0; j < n_decoders_cur; ++j) {
+                            auto & decoder = state->decoders[j];
+                            decoder.sequence.tokens.push_back(forced);
+                            decoder.sequence.sum_logprobs_all += forced.plog;
+
+                            if (params.capture_top_candidates) {
+                                auto top_cands = whisper_get_top_candidates(*ctx, decoder, params.n_top_candidates);
+                                decoder.sequence.top_candidates.push_back(std::move(top_cands));
+                            }
+                        }
+
+                        // Decode the forced token to get logits for next position
+                        if (i < params.forced_n_tokens - 1 || params.forced_n_tokens < whisper_n_text_ctx(ctx)/2 - 4) {
+                            auto & batch = state->batch;
+                            batch.n_tokens = 0;
+
+                            const int n_past = prompt.size() + i;
+
+                            for (int j = 0; j < n_decoders_cur; ++j) {
+                                auto & decoder = state->decoders[j];
+                                decoder.i_batch = batch.n_tokens;
+
+                                batch.token   [batch.n_tokens]    = forced.id;
+                                batch.pos     [batch.n_tokens]    = n_past;
+                                batch.n_seq_id[batch.n_tokens]    = 1;
+                                batch.seq_id  [batch.n_tokens][0] = j;
+                                batch.logits  [batch.n_tokens]    = 1;
+                                batch.n_tokens++;
+                            }
+
+                            if (!whisper_decode_internal(*ctx, *state, batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
+                                WHISPER_LOG_ERROR("%s: failed to decode forced token %d\n", __func__, i);
+                                return -8;
+                            }
+
+                            // Process logits for next iteration
+                            for (int j = 0; j < n_decoders_cur; ++j) {
+                                auto & decoder = state->decoders[j];
+                                whisper_process_logits(*ctx, *state, decoder, params, t_cur);
+                            }
+                        }
+                    }
+                }
             }
 
-            for (int i = 0, n_max = whisper_n_text_ctx(ctx)/2 - 4; i < n_max; ++i) {
+            const int i_start = (params.forced_tokens != nullptr) ? params.forced_n_tokens : 0;
+            for (int i = i_start, n_max = whisper_n_text_ctx(ctx)/2 - 4; i < n_max; ++i) {
                 const int64_t t_start_sample_us = ggml_time_us();
 
                 if (params.strategy == whisper_sampling_strategy::WHISPER_SAMPLING_BEAM_SEARCH) {
@@ -7215,15 +7347,32 @@ int whisper_full_with_state(
                                         }
 
                                         decoder.sequence.sum_logprobs_all += decoder.sequence.tokens.back().plog;
+
+                                        // Capture top candidates if enabled
+                                        if (params.capture_top_candidates) {
+                                            auto top_cands = whisper_get_top_candidates(*ctx, decoder, params.n_top_candidates);
+                                            decoder.sequence.top_candidates.push_back(std::move(top_cands));
+                                        }
                                     } break;
                                 case whisper_sampling_strategy::WHISPER_SAMPLING_BEAM_SEARCH:
                                     {
                                         const auto tokens_new = whisper_sample_token_topk(*ctx, decoder, params.beam_search.beam_size);
 
+                                        // Capture top candidates if enabled (only once per token position)
+                                        std::vector<whisper_token_candidate> top_cands;
+                                        if (params.capture_top_candidates) {
+                                            top_cands = whisper_get_top_candidates(*ctx, decoder, params.n_top_candidates);
+                                        }
+
                                         for (const auto & token : tokens_new) {
                                             bc_per_dec[j].push_back({ j, decoder.seek_delta, decoder.has_ts, decoder.sequence, decoder.grammar, });
                                             bc_per_dec[j].back().sequence.tokens.push_back(token);
                                             bc_per_dec[j].back().sequence.sum_logprobs_all += token.plog;
+
+                                            // Add the same top candidates to all beam search branches
+                                            if (params.capture_top_candidates) {
+                                                bc_per_dec[j].back().sequence.top_candidates.push_back(top_cands);
+                                            }
                                         }
                                     } break;
                             };
@@ -7574,6 +7723,7 @@ int whisper_full_with_state(
             const auto result_len = best_decoder.sequence.result_len;
 
             const auto & tokens_cur = best_decoder.sequence.tokens;
+            const auto & top_candidates_cur = best_decoder.sequence.top_candidates;
 
             // [EXPERIMENTAL] Token-level timestamps with DTW
             const auto n_segments_before = state->result_all.size();
@@ -7635,9 +7785,13 @@ int whisper_full_with_state(
 
                             //printf("tt0 = %d, tt1 = %d, text = %s, token = %s, token_id = %d, tid = %d\n", tt0, tt1, text.c_str(), ctx->vocab.id_to_token[tokens_cur[i].id].c_str(), tokens_cur[i].id, tokens_cur[i].tid);
 
-                            result_all.push_back({ tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next });
+                            result_all.push_back({ tt0, tt1, text, state->no_speech_prob, {}, {}, speaker_turn_next });
                             for (int j = i0; j <= i; j++) {
                                 result_all.back().tokens.push_back(tokens_cur[j]);
+                                // Copy top candidates if available
+                                if (params.capture_top_candidates && j < (int)top_candidates_cur.size()) {
+                                    result_all.back().top_candidates.push_back(top_candidates_cur[j]);
+                                }
                             }
 
                             int n_new = 1;
@@ -7680,9 +7834,13 @@ int whisper_full_with_state(
                         }
                     }
 
-                    result_all.push_back({ tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next });
+                    result_all.push_back({ tt0, tt1, text, state->no_speech_prob, {}, {}, speaker_turn_next });
                     for (int j = i0; j < (int) tokens_cur.size(); j++) {
                         result_all.back().tokens.push_back(tokens_cur[j]);
+                        // Copy top candidates if available
+                        if (params.capture_top_candidates && j < (int)top_candidates_cur.size()) {
+                            result_all.back().top_candidates.push_back(top_candidates_cur[j]);
+                        }
                     }
 
                     int n_new = 1;
@@ -8048,6 +8206,30 @@ float whisper_full_get_token_p_from_state(struct whisper_state * state, int i_se
 
 float whisper_full_get_token_p(struct whisper_context * ctx, int i_segment, int i_token) {
     return ctx->state->result_all[i_segment].tokens[i_token].p;
+}
+
+int whisper_full_n_top_candidates_from_state(struct whisper_state * state, int i_segment, int i_token) {
+    const auto & segment = state->result_all[i_segment];
+    if (i_token >= (int)segment.top_candidates.size()) {
+        return 0;
+    }
+    return (int)segment.top_candidates[i_token].size();
+}
+
+int whisper_full_n_top_candidates(struct whisper_context * ctx, int i_segment, int i_token) {
+    return whisper_full_n_top_candidates_from_state(ctx->state, i_segment, i_token);
+}
+
+whisper_token_candidate whisper_full_get_top_candidate_from_state(struct whisper_state * state, int i_segment, int i_token, int i_candidate) {
+    const auto & segment = state->result_all[i_segment];
+    if (i_token >= (int)segment.top_candidates.size() || i_candidate >= (int)segment.top_candidates[i_token].size()) {
+        return { 0, 0.0f, 0.0f };
+    }
+    return segment.top_candidates[i_token][i_candidate];
+}
+
+whisper_token_candidate whisper_full_get_top_candidate(struct whisper_context * ctx, int i_segment, int i_token, int i_candidate) {
+    return whisper_full_get_top_candidate_from_state(ctx->state, i_segment, i_token, i_candidate);
 }
 
 float whisper_full_get_segment_no_speech_prob(struct whisper_context * ctx, int i_segment) {
