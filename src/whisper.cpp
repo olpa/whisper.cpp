@@ -6871,6 +6871,33 @@ int whisper_full_with_state(
         }
     }
 
+    // auto-detect language if not specified
+    if (params.language == nullptr || strlen(params.language) == 0 || strcmp(params.language, "auto") == 0 || params.detect_language) {
+        std::vector<float> probs(whisper_lang_max_id() + 1, 0.0f);
+
+        const auto lang_id = whisper_lang_auto_detect_with_state(ctx, state, 0, params.n_threads, probs.data());
+        if (lang_id < 0) {
+            WHISPER_LOG_ERROR("%s: failed to auto-detect language\n", __func__);
+            return -3;
+        }
+        state->lang_id = lang_id;
+        params.language = whisper_lang_str(lang_id);
+
+        WHISPER_LOG_INFO("%s: auto-detected language: %s (p = %f)\n", __func__, params.language, probs[whisper_lang_id(params.language)]);
+        if (params.detect_language) {
+            return 0;
+        }
+    }
+
+    if (params.token_timestamps) {
+        state->t_beg    = 0;
+        state->t_last   = 0;
+        state->tid_last = 0;
+        if (n_samples > 0) {
+            state->energy = get_signal_energy(samples, n_samples, 32);
+        }
+    }
+
     const int seek_start = params.offset_ms/10;
     const int seek_end = params.duration_ms == 0 ? whisper_n_len_from_state(state) : seek_start + params.duration_ms/10;
 
@@ -6884,9 +6911,16 @@ int whisper_full_with_state(
         return 0;
     }
 
-    // temperature is fixed to 0.0
+    // a set of temperatures to use
+    // [ t0, t0 + delta, t0 + 2*delta, ..., < 1.0f + 1e-6f ]
     std::vector<float> temperatures;
-    temperatures.push_back(0.0f);
+    if (params.temperature_inc > 0.0f) {
+        for (float t = params.temperature; t < 1.0f + 1e-6f; t += params.temperature_inc) {
+            temperatures.push_back(t);
+        }
+    } else {
+        temperatures.push_back(params.temperature);
+    }
 
     // initialize the decoders
     int n_decoders = 1;
@@ -7869,6 +7903,21 @@ int whisper_full(
     struct whisper_full_params   params,
                    const float * samples,
                            int   n_samples) {
+
+    std::vector<float> vad_samples;
+    if (params.vad) {
+        WHISPER_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
+        if (!whisper_vad(ctx, ctx->state, params, samples, n_samples, vad_samples)) {
+            WHISPER_LOG_ERROR("%s: failed to compute VAD\n", __func__);
+            return -1;
+        }
+        if (vad_samples.empty()) {
+            ctx->state->result_all.clear();
+            return 0;
+        }
+        samples = vad_samples.data();
+        n_samples = vad_samples.size();
+    }
     return whisper_full_with_state(ctx, ctx->state, params, samples, n_samples);
 }
 

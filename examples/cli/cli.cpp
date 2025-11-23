@@ -80,9 +80,6 @@ struct whisper_params {
     bool suppress_nst    = false;
     bool carry_initial_prompt = false;
 
-    bool capture_top_candidates = false;
-    int  n_top_candidates = 20;
-
     std::string language  = "en";
     std::string prompt;
     std::string font_path = "/System/Library/Fonts/Supplemental/Courier New Bold.ttf";
@@ -205,7 +202,6 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (                  arg == "--grammar")              { params.grammar         = ARGV_NEXT; }
         else if (                  arg == "--grammar-rule")         { params.grammar_rule    = ARGV_NEXT; }
         else if (                  arg == "--grammar-penalty")      { params.grammar_penalty = std::stof(ARGV_NEXT); }
-        else if (                  arg == "--top-candidates")       { params.n_top_candidates = std::stoi(ARGV_NEXT); params.capture_top_candidates = true; }
         // Voice Activity Detection (VAD)
         else if (                  arg == "--vad")                         { params.vad                         = true; }
         else if (arg == "-vm"   || arg == "--vad-model")                   { params.vad_model                   = ARGV_NEXT; }
@@ -287,7 +283,6 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  --grammar GRAMMAR                 [%-7s] GBNF grammar to guide decoding\n",                 params.grammar.c_str());
     fprintf(stderr, "  --grammar-rule RULE               [%-7s] top-level GBNF grammar rule name\n",               params.grammar_rule.c_str());
     fprintf(stderr, "  --grammar-penalty N               [%-7.1f] scales down logits of nongrammar tokens\n",      params.grammar_penalty);
-    fprintf(stderr, "  --top-candidates N                [%-7d] capture top N candidate tokens with logprobs\n",    params.n_top_candidates);
     // Voice Activity Detection (VAD) parameters
     fprintf(stderr, "\nVoice Activity Detection (VAD) options:\n");
     fprintf(stderr, "             --vad                           [%-7s] enable Voice Activity Detection (VAD)\n",            params.vad ? "true" : "false");
@@ -1207,9 +1202,6 @@ int main(int argc, char ** argv) {
             wparams.no_timestamps    = params.no_timestamps;
 
             wparams.suppress_nst     = params.suppress_nst;
-
-            wparams.capture_top_candidates = params.capture_top_candidates;
-            wparams.n_top_candidates       = params.n_top_candidates;
 
             wparams.vad            = params.vad;
             wparams.vad_model_path = params.vad_model.c_str();
