@@ -86,10 +86,14 @@ echo "Copying headers..."
 cp "$SCRIPT_DIR/include/whisper.h" "$INSTALL_PREFIX/include/"
 cp "$SCRIPT_DIR/ggml/include/ggml.h" "$INSTALL_PREFIX/include/"
 cp "$SCRIPT_DIR/ggml/include/ggml-cpu.h" "$INSTALL_PREFIX/include/"
+cp "$SCRIPT_DIR/ggml/include/ggml-backend.h" "$INSTALL_PREFIX/include/"
+cp "$SCRIPT_DIR/ggml/include/ggml-alloc.h" "$INSTALL_PREFIX/include/"
 
 # Copy Linux library
 echo "Copying Linux x86_64 library..."
-cp "$SCRIPT_DIR/build-linux-x86_64/src/libwhisper.so" "$INSTALL_PREFIX/linux-x86_64/"
+# Copy whisper with version symlinks
+cp -P "$SCRIPT_DIR/build-linux-x86_64/src/libwhisper.so"* "$INSTALL_PREFIX/linux-x86_64/"
+# Copy ggml libraries (these don't have versioning yet, but copy as-is)
 cp "$SCRIPT_DIR/build-linux-x86_64/ggml/src/libggml.so" "$INSTALL_PREFIX/linux-x86_64/"
 cp "$SCRIPT_DIR/build-linux-x86_64/ggml/src/libggml-base.so" "$INSTALL_PREFIX/linux-x86_64/"
 cp "$SCRIPT_DIR/build-linux-x86_64/ggml/src/libggml-cpu.so" "$INSTALL_PREFIX/linux-x86_64/"
