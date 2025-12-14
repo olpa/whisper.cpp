@@ -2868,6 +2868,23 @@ static bool whisper_decode_internal(
 
     struct ggml_tensor * logits;
 
+    // Debug logging: print decoder info and already decoded tokens
+    {
+        std::set<int> decoder_ids;
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (batch.n_seq_id[i] > 0) decoder_ids.insert(batch.seq_id[i][0]);
+        }
+        for (int decoder_id : decoder_ids) {
+            const auto & decoder = wstate.decoders[decoder_id];
+            const auto & tokens = decoder.sequence.tokens;
+            fprintf(stderr, "[DECODE] Dec:%d Tokens(%zu):", decoder_id, tokens.size());
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                fprintf(stderr, " %d='%s'", tokens[i].id, wctx.vocab.id_to_token.at(tokens[i].id).c_str());
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     // find KV slot for the batch
     {
         auto & kv_self = wstate.kv_self;

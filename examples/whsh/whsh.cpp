@@ -17,6 +17,7 @@
 // - help, ? : Show available commands
 // - pos N top [K] : Show top K candidate tokens at position N (default K=10)
 // - pos N id TID : Force token TID at position N and re-transcribe from that point
+// - pos N new : Take first N tokens and re-transcribe in new context
 // - quit, exit : Exit the shell
 // - Arrow Up/Down : Navigate command history
 //
@@ -145,6 +146,7 @@ void print_help() {
     printf("  help, ?           - Show this help message\n");
     printf("  pos N top [K]     - Show top K candidates at position N (default K=10)\n");
     printf("  pos N id TID      - Force token TID at position N and re-transcribe\n");
+    printf("  pos N new         - Take first N tokens and re-transcribe in new context\n");
     printf("  quit, exit        - Exit the shell\n");
     printf("  Arrow Up/Down     - Navigate command history\n");
     printf("\n");
@@ -354,9 +356,9 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
-            // Read subcommand (either "top" or "id")
+            // Read subcommand (either "top", "id", or "new")
             if (!(iss >> subcommand)) {
-                printf("Usage: pos N top [K] or pos N id TID\n");
+                printf("Usage: pos N top [K], pos N id TID, or pos N new\n");
                 continue;
             }
 
@@ -424,8 +426,33 @@ int main(int argc, char ** argv) {
                 if (token_map.empty()) {
                     printf("Re-transcription failed\n");
                 }
+            } else if (subcommand == "new") {
+                // Command: pos N new
+                // Take first N tokens and re-transcribe in new context
+
+                // Validate position
+                if (pos_n < 0 || pos_n >= (int)token_map.size()) {
+                    printf("Error: position %d out of range [0, %d]\n", pos_n, (int)token_map.size() - 1);
+                    continue;
+                }
+
+                printf("Re-transcribing with tokens 0-%d in new context (fresh encoding + forced_tokens)...\n", pos_n);
+
+                // Build forced tokens: take tokens 0 to N (inclusive)
+                std::vector<whisper_token> forced_tokens;
+                for (int i = 0; i <= pos_n; i++) {
+                    const TokenPosition& tpos = token_map[i];
+                    forced_tokens.push_back(whisper_full_get_token_id(ctx, tpos.segment_idx, tpos.token_idx));
+                }
+
+                // Re-transcribe with skip_encode=false (fresh encoding) and forced_tokens
+                token_map = do_transcription(ctx, pcmf32, &forced_tokens, false);
+
+                if (token_map.empty()) {
+                    printf("Re-transcription failed\n");
+                }
             } else {
-                printf("Unknown subcommand: '%s'. Usage: pos N top [K] or pos N id TID\n", subcommand.c_str());
+                printf("Unknown subcommand: '%s'. Usage: pos N top [K], pos N id TID, or pos N new\n", subcommand.c_str());
             }
         } else if (!line.empty()) {
             printf("Unknown command: '%s'. Type 'help' or '?' for available commands.\n", line.c_str());
