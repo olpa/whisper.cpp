@@ -18,6 +18,7 @@
 // - pos N top [K] : Show top K candidate tokens at position N (default K=10)
 // - pos N id TID : Force token TID at position N and re-transcribe from that point
 // - pos N new : Take first N tokens and re-transcribe in new context
+// - tok <text> : Tokenize text with and without leading space
 // - quit, exit : Exit the shell
 // - Arrow Up/Down : Navigate command history
 //
@@ -147,6 +148,7 @@ void print_help() {
     printf("  pos N top [K]     - Show top K candidates at position N (default K=10)\n");
     printf("  pos N id TID      - Force token TID at position N and re-transcribe\n");
     printf("  pos N new         - Take first N tokens and re-transcribe in new context\n");
+    printf("  tok <text>        - Tokenize text with and without leading space\n");
     printf("  quit, exit        - Exit the shell\n");
     printf("  Arrow Up/Down     - Navigate command history\n");
     printf("\n");
@@ -454,6 +456,52 @@ int main(int argc, char ** argv) {
             } else {
                 printf("Unknown subcommand: '%s'. Usage: pos N top [K], pos N id TID, or pos N new\n", subcommand.c_str());
             }
+        } else if (cmd == "tok") {
+            // Command: tok <text>
+            // Tokenize the remaining text with and without leading space
+
+            // Get the rest of the line as the text to tokenize
+            std::string text;
+            std::getline(iss, text);
+
+            // Trim leading whitespace from text
+            size_t start = text.find_first_not_of(" \t");
+            if (start == std::string::npos) {
+                printf("Usage: tok <text>\n");
+                continue;
+            }
+            text = text.substr(start);
+
+            if (text.empty()) {
+                printf("Usage: tok <text>\n");
+                continue;
+            }
+
+            // Tokenize without leading space
+            std::vector<whisper_token> tokens1(text.size() + 10);
+            int n_tokens1 = whisper_tokenize(ctx, text.c_str(), tokens1.data(), tokens1.size());
+            tokens1.resize(n_tokens1);
+
+            // Tokenize with leading space
+            std::string text_with_space = " " + text;
+            std::vector<whisper_token> tokens2(text_with_space.size() + 10);
+            int n_tokens2 = whisper_tokenize(ctx, text_with_space.c_str(), tokens2.data(), tokens2.size());
+            tokens2.resize(n_tokens2);
+
+            // Print results
+            printf("\nTokenization of '%s':\n", text.c_str());
+            printf("  Without space (%d tokens):", n_tokens1);
+            for (int i = 0; i < n_tokens1; i++) {
+                printf(" %d='%s'", tokens1[i], whisper_token_to_str(ctx, tokens1[i]));
+            }
+            printf("\n");
+
+            printf("Tokenization of ' %s':\n", text.c_str());
+            printf("  With space    (%d tokens):", n_tokens2);
+            for (int i = 0; i < n_tokens2; i++) {
+                printf(" %d='%s'", tokens2[i], whisper_token_to_str(ctx, tokens2[i]));
+            }
+            printf("\n\n");
         } else if (!line.empty()) {
             printf("Unknown command: '%s'. Type 'help' or '?' for available commands.\n", line.c_str());
         }
