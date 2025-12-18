@@ -6088,6 +6088,7 @@ static int whisper_wrap_segment(struct whisper_context & ctx, struct whisper_sta
             state.result_all.back().text = std::move(text);
             state.result_all.back().t1 = token.t0;
             state.result_all.back().tokens.resize(i);
+            state.result_all.back().top_candidates.resize(i);
             state.result_all.back().speaker_turn_next = false;
 
             state.result_all.push_back({});
@@ -6099,6 +6100,12 @@ static int whisper_wrap_segment(struct whisper_context & ctx, struct whisper_sta
                 state.result_all.back().tokens.end(),
                     segment.tokens.begin() + i,
                     segment.tokens.end());
+
+            // add top candidates [i, end] to the new segment
+            state.result_all.back().top_candidates.insert(
+                state.result_all.back().top_candidates.end(),
+                    segment.top_candidates.begin() + i,
+                    segment.top_candidates.end());
 
             state.result_all.back().speaker_turn_next = segment.speaker_turn_next;
 
@@ -7145,6 +7152,7 @@ skip_encode:
                 auto & decoder = state->decoders[j];
 
                 decoder.sequence.tokens.clear();
+                decoder.sequence.top_candidates.clear();
                 decoder.sequence.result_len       = 0;
                 decoder.sequence.sum_logprobs_all = 0.0;
                 decoder.sequence.sum_logprobs     = -INFINITY;
@@ -7681,6 +7689,7 @@ skip_encode:
                     }
 
                     decoder.sequence.tokens.resize(decoder.sequence.result_len);
+                    decoder.sequence.top_candidates.resize(decoder.sequence.result_len);
                     whisper_sequence_score(params, decoder.sequence);
 
                     WHISPER_LOG_DEBUG("%s: decoder %2d: score = %8.5f, result_len = %3d, avg_logprobs = %8.5f, entropy = %8.5f\n",
