@@ -81,6 +81,10 @@ build_platform "Android x86" \
 echo ""
 echo "=== Installing libraries and headers ==="
 
+# Create VERSION file
+echo "Creating VERSION file..."
+echo "1.8.2" > "$INSTALL_PREFIX/VERSION"
+
 # Copy headers
 echo "Copying headers..."
 cp "$SCRIPT_DIR/include/whisper.h" "$INSTALL_PREFIX/include/"
