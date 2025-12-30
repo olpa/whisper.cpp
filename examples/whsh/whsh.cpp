@@ -3,6 +3,7 @@
 #include "whisper.h"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -250,18 +251,35 @@ std::vector<TokenPosition> do_transcription(
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
-    // Check command line arguments
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <audio_file>\n", argv[0]);
+    // Default model path
+    const char * model_path = "models/ggml-tiny.en.bin";
+    const char * fname_inp = nullptr;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-m") == 0) {
+            if (i + 1 < argc) {
+                model_path = argv[++i];
+            } else {
+                fprintf(stderr, "error: -m requires a model path argument\n");
+                return 1;
+            }
+        } else {
+            fname_inp = argv[i];
+        }
+    }
+
+    // Check if audio file was provided
+    if (fname_inp == nullptr) {
+        fprintf(stderr, "usage: %s [-m model_path] <audio_file>\n", argv[0]);
         fprintf(stderr, "\n");
         fprintf(stderr, "Interactive whisper shell - transcribes audio then enters interactive mode.\n");
+        fprintf(stderr, "Options:\n");
+        fprintf(stderr, "  -m <model_path>  Path to model file (default: models/ggml-tiny.en.bin)\n");
         fprintf(stderr, "Fixed settings: English, CPU only, single thread, no VAD\n");
         fprintf(stderr, "Supported audio formats: flac, mp3, ogg, wav\n");
         return 1;
     }
-
-    const char * fname_inp = argv[1];
-    const char * model_path = "models/ggml-base.en.bin";
 
     // Check if input file exists
     if (!is_file_exist(fname_inp)) {
