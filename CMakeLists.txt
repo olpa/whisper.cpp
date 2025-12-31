@@ -178,7 +178,7 @@ set_target_properties(whisper PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DI
 install(TARGETS whisper LIBRARY PUBLIC_HEADER)
 
 target_compile_definitions(whisper PRIVATE
-    WHISPER_VERSION="${PROJECT_VERSION}"
+    WHISPER_VERSION="${GIT_TAG}-${GIT_SHA1}"
 )
 
 configure_package_config_file(

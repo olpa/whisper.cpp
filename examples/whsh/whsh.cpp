@@ -251,6 +251,9 @@ std::vector<TokenPosition> do_transcription(
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
+    // Print version on startup
+    fprintf(stderr, "whsh version %s\n", whisper_version());
+
     // Default model path
     const char * model_path = "models/ggml-tiny.en.bin";
     const char * fname_inp = nullptr;
