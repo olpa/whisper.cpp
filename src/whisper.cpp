@@ -2869,6 +2869,7 @@ static bool whisper_decode_internal(
     struct ggml_tensor * logits;
 
     // Debug logging: print decoder info and already decoded tokens
+#ifdef WHISPER_DEBUG
     {
         std::set<int> decoder_ids;
         for (int i = 0; i < batch.n_tokens; ++i) {
@@ -2884,6 +2885,7 @@ static bool whisper_decode_internal(
             fprintf(stderr, "\n");
         }
     }
+#endif
 
     // find KV slot for the batch
     {
