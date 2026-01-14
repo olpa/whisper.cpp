@@ -1,10 +1,11 @@
 #!/bin/bash
-set -e
+set -eu
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANDROID_NDK="${ANDROID_NDK_HOME:-$HOME/android/ndk/27.2.12479018}"
-INSTALL_PREFIX="${HANDSFREEVC_DEV_HOME:-$HOME/handsfree_vc/hfvc_dev}/whisper.cpp"
+echo Install prefix: $HANDSFREEVC_DEV_HOME
+INSTALL_PREFIX="${HANDSFREEVC_DEV_HOME:-$HOME/p/handsfree_vc/hfvc_dev}/whisper.cpp"
 
 # Parse platform arguments (default: all platforms)
 BUILD_LINUX=0
