@@ -93,10 +93,10 @@ build_platform() {
         -DBUILD_SHARED_LIBS=ON \
         -DWHISPER_BUILD_EXAMPLES=OFF \
         -DWHISPER_BUILD_TESTS=OFF \
-        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         "$SCRIPT_DIR"
 
-    cmake --build . --config Release -j$(nproc)
+    cmake --build . --config RelWithDebInfo -j$(nproc)
 
     echo "✓ Build complete for $platform"
     cd "$SCRIPT_DIR"
