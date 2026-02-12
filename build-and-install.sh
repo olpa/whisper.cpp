@@ -114,7 +114,8 @@ if [ $BUILD_ANDROID_ARM64 -eq 1 ]; then
         "$SCRIPT_DIR/build-android-arm64-v8a" \
         -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
         -DANDROID_ABI=arm64-v8a \
-        -DANDROID_PLATFORM=android-21
+        -DANDROID_PLATFORM=android-21 \
+        -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
 fi
 
 # Build Android armeabi-v7a
