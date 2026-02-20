@@ -13,13 +13,14 @@
 #include <unistd.h>
 
 // Interactive whisper shell (whsh)
-// Usage: whsh <audio_file>
+// Usage: whsh [-m model_path] [-l lang] <audio_file>
 // After transcription, enters interactive mode with commands:
 // - help, ? : Show available commands
 // - pos N top [K] : Show top K candidate tokens at position N (default K=10)
 // - pos N id TID : Force token TID at position N and re-transcribe from that point
 // - pos N new : Take first N tokens and re-transcribe in new context
 // - tok <text> : Tokenize text with and without leading space
+// - lang [code] : Show/change language and re-transcribe (e.g., 'en', 'de', 'de-en' for translation)
 // - quit, exit : Exit the shell
 // - Arrow Up/Down : Navigate command history
 //
@@ -150,6 +151,9 @@ void print_help() {
     printf("  pos N id TID      - Force token TID at position N and re-transcribe\n");
     printf("  pos N new         - Take first N tokens and re-transcribe in new context\n");
     printf("  tok <text>        - Tokenize text with and without leading space\n");
+    printf("  lang [code]       - Show/change language and re-transcribe\n");
+    printf("                      Use language code (e.g., 'en', 'de', 'fr') for transcription\n");
+    printf("                      Use 'code-en' (e.g., 'de-en') for translation to English\n");
     printf("  quit, exit        - Exit the shell\n");
     printf("  Arrow Up/Down     - Navigate command history\n");
     printf("\n");
@@ -163,9 +167,11 @@ void print_prompt() {
 // Function to perform transcription and return token map
 // forced_tokens: tokens to force at the start of decoding (for re-transcription with alternatives)
 // skip_encode: if true, reuse kv_cross from previous encode (for re-transcription)
+// lang: language code (e.g., "en", "de", "fr") or "code-en" for automatic translation
 std::vector<TokenPosition> do_transcription(
     struct whisper_context * ctx,
     const std::vector<float> & pcmf32,
+    const char * lang,
     const std::vector<whisper_token> * forced_tokens = nullptr,
     bool skip_encode = false
 ) {
@@ -178,8 +184,18 @@ std::vector<TokenPosition> do_transcription(
     wparams.print_progress   = false;
     wparams.print_timestamps = true;
     wparams.print_special    = false;
-    wparams.translate        = false;
-    wparams.language         = "en";
+
+    // Parse language parameter: if it ends with "-en", enable translation
+    std::string lang_str(lang);
+    if (lang_str.size() >= 3 && lang_str.substr(lang_str.size() - 3) == "-en") {
+        // Extract the source language code (before "-en")
+        std::string source_lang = lang_str.substr(0, lang_str.size() - 3);
+        wparams.translate = true;
+        wparams.language = source_lang.c_str();
+    } else {
+        wparams.translate = false;
+        wparams.language = lang;
+    }
     wparams.n_threads        = n_threads;
     wparams.no_timestamps    = false;
     wparams.token_timestamps = false;
@@ -254,9 +270,10 @@ int main(int argc, char ** argv) {
     // Print version on startup
     fprintf(stderr, "whsh version %s\n", whisper_version());
 
-    // Default model path
+    // Default model path and language
     const char * model_path = "models/ggml-tiny.en.bin";
     const char * fname_inp = nullptr;
+    std::string language = "en";  // Default language (mutable for in-app lang command)
 
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -267,6 +284,13 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "error: -m requires a model path argument\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--lang") == 0) {
+            if (i + 1 < argc) {
+                language = std::string(argv[++i]);
+            } else {
+                fprintf(stderr, "error: -l/--lang requires a language code argument\n");
+                return 1;
+            }
         } else {
             fname_inp = argv[i];
         }
@@ -274,12 +298,15 @@ int main(int argc, char ** argv) {
 
     // Check if audio file was provided
     if (fname_inp == nullptr) {
-        fprintf(stderr, "usage: %s [-m model_path] <audio_file>\n", argv[0]);
+        fprintf(stderr, "usage: %s [-m model_path] [-l lang] <audio_file>\n", argv[0]);
         fprintf(stderr, "\n");
         fprintf(stderr, "Interactive whisper shell - transcribes audio then enters interactive mode.\n");
         fprintf(stderr, "Options:\n");
         fprintf(stderr, "  -m <model_path>  Path to model file (default: models/ggml-tiny.en.bin)\n");
-        fprintf(stderr, "Fixed settings: English, CPU only, single thread, no VAD\n");
+        fprintf(stderr, "  -l, --lang <code> Language code for transcription (default: en)\n");
+        fprintf(stderr, "                   Use language code (e.g., 'en', 'de', 'fr') for transcription\n");
+        fprintf(stderr, "                   Use 'code-en' for automatic translation to English\n");
+        fprintf(stderr, "Fixed settings: CPU only, single thread, no VAD\n");
         fprintf(stderr, "Supported audio formats: flac, mp3, ogg, wav\n");
         return 1;
     }
@@ -322,7 +349,7 @@ int main(int argc, char ** argv) {
 
     // Perform initial transcription (this encodes + decodes)
     // The encoding result (kv_cross) will be reused for re-transcriptions via skip_encode
-    std::vector<TokenPosition> token_map = do_transcription(ctx, pcmf32);
+    std::vector<TokenPosition> token_map = do_transcription(ctx, pcmf32, language.c_str());
 
     if (token_map.empty()) {
         whisper_free(ctx);
@@ -444,7 +471,7 @@ int main(int argc, char ** argv) {
                 }
 
                 // Re-transcribe with skip_encode=true and forced_tokens
-                token_map = do_transcription(ctx, pcmf32, &forced_tokens, true);
+                token_map = do_transcription(ctx, pcmf32, language.c_str(), &forced_tokens, true);
 
                 if (token_map.empty()) {
                     printf("Re-transcription failed\n");
@@ -469,7 +496,7 @@ int main(int argc, char ** argv) {
                 }
 
                 // Re-transcribe with skip_encode=false (fresh encoding) and forced_tokens
-                token_map = do_transcription(ctx, pcmf32, &forced_tokens, false);
+                token_map = do_transcription(ctx, pcmf32, language.c_str(), &forced_tokens, false);
 
                 if (token_map.empty()) {
                     printf("Re-transcription failed\n");
@@ -523,6 +550,28 @@ int main(int argc, char ** argv) {
                 printf(" %d='%s'", tokens2[i], whisper_token_to_str(ctx, tokens2[i]));
             }
             printf("\n\n");
+        } else if (cmd == "lang") {
+            // Command: lang <code>
+            // Change language and re-transcribe
+
+            std::string new_lang;
+            if (!(iss >> new_lang)) {
+                printf("Current language: %s\n", language.c_str());
+                printf("Usage: lang <code>\n");
+                printf("  <code> can be a language code (e.g., 'en', 'de', 'fr') for transcription\n");
+                printf("  or 'code-en' (e.g., 'de-en', 'fr-en') for automatic translation to English\n");
+                continue;
+            }
+
+            printf("Changing language from '%s' to '%s' and re-transcribing...\n", language.c_str(), new_lang.c_str());
+            language = new_lang;
+
+            // Re-transcribe with new language (skip_encode=false to get fresh encoding)
+            token_map = do_transcription(ctx, pcmf32, language.c_str(), nullptr, false);
+
+            if (token_map.empty()) {
+                printf("Re-transcription failed\n");
+            }
         } else if (!line.empty()) {
             printf("Unknown command: '%s'. Type 'help' or '?' for available commands.\n", line.c_str());
         }
